@@ -17,6 +17,7 @@ class GenerateTextRequest extends FormRequest
             // Accept either a raw prompt string or a full contents array (shape used by the Gemini API)
             'prompt' => 'required_without:contents|string|max:2000',
             'contents' => 'sometimes|array',
+            'link_url' => 'sometimes|nullable|url|max:2000',
             'tone' => 'sometimes|string',
             'length' => 'sometimes|in:short,medium,long',
             'model' => 'sometimes|string',

@@ -21,13 +21,14 @@ class GenerativeController extends Controller
     {
         $options = $request->only(['tone', 'length', 'model']);
         // Accept either a raw prompt or content array (already shaped like Gemini's contents check)
+        $linkUrl = $request->input('link_url');
         if ($request->has('contents')) {
             $contents = $request->input('contents');
             $options['contents'] = $contents;
-            $result = $this->gemini->generateTextFromContents($options['contents'], 'facebook', $options);
+            $result = $this->gemini->generateTextFromContents($options['contents'], 'facebook', $options, $linkUrl);
         } else {
             $prompt = $request->input('prompt');
-            $result = $this->gemini->generateText($prompt, 'facebook', $options);
+            $result = $this->gemini->generateText($prompt, 'facebook', $options, $linkUrl);
         }
         return response()->json($result, $result['status'] ?? 200);
     }
@@ -35,13 +36,14 @@ class GenerativeController extends Controller
     public function generateInstagram(GenerateTextRequest $request): JsonResponse
     {
         $options = $request->only(['tone', 'length', 'model']);
+        $linkUrl = $request->input('link_url');
         if ($request->has('contents')) {
             $contents = $request->input('contents');
             $options['contents'] = $contents;
-            $result = $this->gemini->generateTextFromContents($options['contents'], 'instagram', $options);
+            $result = $this->gemini->generateTextFromContents($options['contents'], 'instagram', $options, $linkUrl);
         } else {
             $prompt = $request->input('prompt');
-            $result = $this->gemini->generateText($prompt, 'instagram', $options);
+            $result = $this->gemini->generateText($prompt, 'instagram', $options, $linkUrl);
         }
         return response()->json($result, $result['status'] ?? 200);
     }
@@ -49,13 +51,14 @@ class GenerativeController extends Controller
     public function generatePodcast(GenerateTextRequest $request): JsonResponse
     {
         $options = $request->only(['tone', 'length', 'model']);
+        $linkUrl = $request->input('link_url');
         if ($request->has('contents')) {
             $contents = $request->input('contents');
             $options['contents'] = $contents;
-            $result = $this->gemini->generateTextFromContents($options['contents'], 'podcast', $options);
+            $result = $this->gemini->generateTextFromContents($options['contents'], 'podcast', $options, $linkUrl);
         } else {
             $prompt = $request->input('prompt');
-            $result = $this->gemini->generateText($prompt, 'podcast', $options);
+            $result = $this->gemini->generateText($prompt, 'podcast', $options, $linkUrl);
         }
         return response()->json($result, $result['status'] ?? 200);
     }

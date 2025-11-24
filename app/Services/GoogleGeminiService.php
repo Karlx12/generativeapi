@@ -20,7 +20,7 @@ class GoogleGeminiService
     $this->model = config('generative.google_model') ?: env('GEMINI_MODEL') ?: '';
     }
 
-    public function generateText(string $userPrompt, string $channel = 'generic', array $options = []): array
+    public function generateText(string $userPrompt, string $channel = 'generic', array $options = [], ?string $linkUrl = null): array
     {
         $wrapped = $this->wrapPromptForChannel($userPrompt, $channel);
 
@@ -56,16 +56,29 @@ class GoogleGeminiService
         $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
 
-        return $this->formatResponse($response);
+        $formatted = $this->formatResponse($response);
+
+        // If we received textual candidates, try to extract and clean the first candidate
+        if ($formatted['success'] && !empty($formatted['payload'])) {
+            $rawText = $this->extractFirstTextFromPayload($formatted['payload']);
+            if (!empty($rawText)) {
+                $cleaned = $this->cleanGeneratedText($rawText, $linkUrl, $channel);
+                $formatted['payload']['generated_text'] = $cleaned;
+            }
+        }
+
+        return $formatted;
     }
 
-    public function generateTextFromContents(array $contents, string $channel = 'generic', array $options = []): array
+    public function generateTextFromContents(array $contents, string $channel = 'generic', array $options = [], ?string $linkUrl = null): array
     {
         // Directly use provided contents array (assumed shaped as Gemini's contents format)
         // If user supplied tone or length in options, prepend these as an initial "system" part
         $tone = $options['tone'] ?? null;
         $length = $options['length'] ?? null;
         // Always ensure Spanish instruction is present at the start
+        // Base instruction: always reply in Spanish. For channel-specific formatting (eg Facebook)
+        // we will add extra constraints elsewhere.
         $preParts = ['Responde siempre en español.'];
         if ($tone) $preParts[] = "Tone: {$tone}.";
         if ($length) $preParts[] = "Length: {$length}.";
@@ -85,7 +98,17 @@ class GoogleGeminiService
         }
         $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
-        return $this->formatResponse($response);
+        $formatted = $this->formatResponse($response);
+
+        if ($formatted['success'] && !empty($formatted['payload'])) {
+            $rawText = $this->extractFirstTextFromPayload($formatted['payload']);
+            if (!empty($rawText)) {
+                $cleaned = $this->cleanGeneratedText($rawText, $linkUrl, $channel);
+                $formatted['payload']['generated_text'] = $cleaned;
+            }
+        }
+
+        return $formatted;
     }
 
     public function generateImage(string $userPrompt, array $options = []): array
@@ -529,7 +552,7 @@ class GoogleGeminiService
 
     protected function wrapPromptForAudio(string $prompt, array $options = []): string
     {
-        return "Responde siempre en español. Genera contenido de audio con estas instrucciones: " . $prompt;
+        return "Responde siempre en español. Genera contenido de audio basado en: " . $prompt;
     }
 
     protected function wrapPromptForVideo(string $prompt, array $options = []): string
@@ -551,19 +574,125 @@ class GoogleGeminiService
         switch (strtolower($channel)) {
             case 'facebook':
                 // short conversational posts, engaging tone
-                return $base . " Escribe una publicación corta y atractiva para Facebook basada en: " . $prompt;
+                    return $base . " Responde en texto plano, sin Markdown ni URL. Puedes usar emojis. Escribe una publicación corta y atractiva para Facebook basada en: " . $prompt;
 
             case 'instagram':
                 // captions + relevant hashtags
-                return $base . " Escribe un pie de foto para Instagram (breve, con emojis y algunos hashtags) basado en: " . $prompt;
+                    return $base . " Escribe un pie de foto para Instagram (breve, con emojis y algunos hashtags) basado en: " . $prompt;
 
             case 'podcast':
                 // longer form, show notes / segment script
-                return $base . " Escribe un guión o descripción para un episodio de podcast (un par de párrafos) basado en: " . $prompt;
+                    return $base . " Escribe un guión o descripción para un episodio de podcast (un par de párrafos) basado en: " . $prompt;
 
             default:
                 // generic text generation
                 return $base . " " . $prompt;
         }
+    }
+
+    /**
+     * Try to extract the primary textual candidate from the Gemini payload.
+     */
+    protected function extractFirstTextFromPayload(array $payload): ?string
+    {
+        // payload.candidates[].content.parts[].text (typical for generateContent)
+        if (!empty($payload['candidates']) && is_array($payload['candidates'])) {
+            $candidate = $payload['candidates'][0] ?? null;
+            if ($candidate && !empty($candidate['content']['parts']) && is_array($candidate['content']['parts'])) {
+                $texts = array_map(fn($p) => $p['text'] ?? '', $candidate['content']['parts']);
+                return trim(implode("\n", array_filter($texts)));
+            }
+        }
+
+        // fallback: payload.text or generated_text
+        if (!empty($payload['text'])) return trim($payload['text']);
+        if (!empty($payload['generated_text'])) return trim($payload['generated_text']);
+
+        // some responses use payload.candidates[0].text
+        if (!empty($payload['candidates'][0]['text'])) return trim($payload['candidates'][0]['text']);
+
+        return null;
+    }
+
+    /**
+     * Clean the generated text removing assistant preambles, separators and replace link placeholder with provided link_url.
+     */
+    protected function cleanGeneratedText(string $raw, ?string $linkUrl = null, ?string $channel = null): string
+    {
+        $text = $raw;
+
+        // If there is an explicit '---' separator, take everything after the last occurrence
+        if (preg_match('/-{3,}/', $text)) {
+            $parts = preg_split('/-{3,}/', $text);
+            $text = trim(end($parts));
+        } else {
+            // If the first paragraph looks like a preamble/greeting (contains 'Claro', 'Aquí tienes', 'publicación para'), drop it
+            $chunks = preg_split('/\r?\n\r?\n/', $text, 2);
+            if (count($chunks) === 2) {
+                $first = strtolower($chunks[0]);
+                if (str_contains($first, 'claro') || str_contains($first, 'aquí tienes') || str_contains($first, 'a continuaci') || str_contains($first, 'una publicación') || str_contains($first, 'publicación para') || str_contains($first, 'hola')) {
+                    $text = trim($chunks[1]);
+                }
+            }
+        }
+
+        // Replace common placeholder patterns like (tu enlace aquí), [Tu enlace aquí] or 'tu enlace aquí'
+        if (!empty($linkUrl)) {
+            $pattern = '/[\(\[]?\s*(tu enlace aquí|tu enlace)\s*[\)\]]?/ui';
+            $hadPlaceholder = preg_match($pattern, $text);
+            if ($hadPlaceholder) {
+                $text = preg_replace($pattern, $linkUrl, $text);
+            } else {
+                // if no placeholder present and the result doesn't already contain an URL, append a short link line
+                if (!preg_match('/https?:\/\//i', $text)) {
+                    $text = trim($text) . "\n\nMás información e inscripciones: " . $linkUrl;
+                }
+            }
+        } else {
+            // Remove any remaining placeholders if no link_url provided
+            $text = preg_replace('/[\(\[]?\s*(tu enlace aquí|tu enlace)\s*[\)\]]?/ui', '', $text);
+        }
+
+        // If this is for Facebook, remove Markdown artifacts and strip URLs (we require plain text/no URLs for Facebook)
+        if (strtolower((string)$channel) === 'facebook') {
+            // Remove Markdown artifacts (code fences, inline code, headings, emphasis, lists, bold/italic markers)
+        // 1) remove code fences ``` ``` blocks
+        $text = preg_replace('/```.*?```/s', '', $text);
+        // 2) remove inline backticks
+        $text = preg_replace('/`([^`]*)`/', '$1', $text);
+        // 3) remove markdown headings (# ...)
+        $text = preg_replace('/^#{1,6}\s*/m', '', $text);
+        // 4) remove bold/italic markers (**bold**, *italic*, __bold__, _italic_)
+        $text = preg_replace('/(\*\*|__)(.*?)\1/', '$2', $text);
+        $text = preg_replace('/(\*|_)(.*?)\1/', '$2', $text);
+        // 5) remove ordered/unordered list markers at line starts (e.g. '- ', '* ', '1. ')
+        $text = preg_replace('/^\s*[-\*+]\s+/m', '', $text);
+        $text = preg_replace('/^\s*\d+\.\s+/m', '', $text);
+
+        // Remove any stray horizontal rules
+        $text = preg_replace('/^-{3,}\s*$/m', '', $text);
+
+            // Remove any URLs left in the model output. If linkUrl was provided and we replaced/added it,
+            // preserve occurrences equal to $linkUrl but strip other URLs.
+            if (!empty($linkUrl)) {
+            // remove URLs except the exact $linkUrl
+            $text = preg_replace_callback('/https?:\/\/\S+/i', function ($m) use ($linkUrl) {
+                return strcasecmp($m[0], $linkUrl) === 0 ? $m[0] : '';
+            }, $text);
+        } else {
+            // remove any URL-like substrings
+            $text = preg_replace('/https?:\/\/\S+/i', '', $text);
+        }
+
+            // Collapse multiple blank lines
+            $text = preg_replace('/\n{3,}/', "\n\n", $text);
+        } else {
+            // For non-Facebook channels, only ensure we don't leave leftover placeholders; keep any URLs the model returned.
+            // Collapse extra blank lines regardless.
+            $text = preg_replace('/\n{3,}/', "\n\n", $text);
+        }
+
+        // Final trim and return
+        return trim($text);
     }
 }
