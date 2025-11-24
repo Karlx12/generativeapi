@@ -121,6 +121,51 @@ class GenerativeController extends Controller
         return response()->download($path, $audio['filename']);
     }
 
+    public function listImages(): JsonResponse
+    {
+        $result = $this->gemini->listSavedImages();
+        return response()->json($result, $result['status'] ?? 200);
+    }
+
+    public function sendImage(Request $request)
+    {
+        $id = $request->input('id');
+        if (! $id) {
+            return response()->json(['success' => false, 'status' => 400, 'body' => 'Missing image id'], 400);
+        }
+
+        $image = $this->gemini->getSavedImageById($id);
+        if (! $image) {
+            return response()->json(['success' => false, 'status' => 404, 'body' => 'Image not found'], 404);
+        }
+
+        $path = storage_path('app/' . $image['path']);
+        if (! file_exists($path)) {
+            return response()->json(['success' => false, 'status' => 404, 'body' => 'Image file missing'], 404);
+        }
+
+        return response()->download($path, $image['filename']);
+    }
+
+    public function downloadImage($id)
+    {
+        if (! $id) {
+            return response()->json(['success' => false, 'status' => 400, 'body' => 'Missing image id'], 400);
+        }
+
+        $image = $this->gemini->getSavedImageById($id);
+        if (! $image) {
+            return response()->json(['success' => false, 'status' => 404, 'body' => 'Image not found'], 404);
+        }
+
+        $path = storage_path('app/' . $image['path']);
+        if (! file_exists($path)) {
+            return response()->json(['success' => false, 'status' => 404, 'body' => 'Image file missing'], 404);
+        }
+
+        return response()->download($path, $image['filename']);
+    }
+
     public function generateVideo(GenerateMediaRequest $request): JsonResponse
     {
         $prompt = $request->input('prompt');

@@ -90,36 +90,85 @@ class GoogleGeminiService
 
     public function generateImage(string $userPrompt, array $options = []): array
     {
-        $wrapped = $this->wrapPromptForImage($userPrompt, $options);
-        $payload = [
-            'contents' => [[
-                'parts' => [[ 'text' => $wrapped ]]
-            ]]
-        ];
-        $model = $options['model'] ?? $this->model;
-        if (empty($model)) {
-            return [
-                'success' => false,
-                'status' => 500,
-                'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
-            ];
-        }
-    // Use generic generateContent endpoint for image generation — some image models
-    // return inline base64 image data under content.parts[0].inlineData.data
-    $uri = '/models/' . $model . ':generateContent';
-        $response = $this->post($uri, $payload);
-        $formatted = $this->formatResponse($response);
+        // Translate prompt to English if necessary, using Gemini
+        $englishPrompt = $this->translateToEnglish($userPrompt);
+        // Imagen only supports English prompts
 
-        // If the API returned inline image data, save it and return metadata
-        if ($formatted['success'] && isset($formatted['payload']['candidates'][0]['content']['parts'][0]['inlineData']['data'])) {
-            $base64 = $formatted['payload']['candidates'][0]['content']['parts'][0]['inlineData']['data'];
-            $saved = $this->saveGeneratedImage($base64, $userPrompt, $model);
-            if ($saved['success']) {
-                $formatted['payload']['saved_image'] = $saved['image'];
+        // Support both `numberOfImages` and `sampleCount` as input. Clamp to 1..4
+        $requested = $options['numberOfImages'] ?? $options['sampleCount'] ?? null;
+        $sampleCount = is_numeric($requested) ? (int)$requested : null;
+        if (is_null($sampleCount)) {
+            // Imagen default is 4
+            $sampleCount = 4;
+        }
+        // enforce allowed range 1-4
+        $sampleCount = max(1, min(4, $sampleCount));
+
+        // Validate aspect ratio: allowed values per Imagen docs
+        $allowedAspect = ['1:1', '3:4', '4:3', '9:16', '16:9'];
+        $aspectRatio = $options['aspectRatio'] ?? '1:1';
+        if (! in_array($aspectRatio, $allowedAspect, true)) {
+            $aspectRatio = '1:1';
+        }
+
+        // Validate personGeneration
+        $pg = $options['personGeneration'] ?? 'allow_adult';
+        $allowedPersonGen = ['dont_allow', 'allow_adult', 'allow_all'];
+        if (! in_array($pg, $allowedPersonGen, true)) {
+            $pg = 'allow_adult';
+        }
+
+        // Validate imageSize only if provided: allowed values 1K, 2K
+        $imageSize = $options['imageSize'] ?? null;
+        if (! is_null($imageSize)) {
+            $imageSize = strtoupper($imageSize);
+            if (! in_array($imageSize, ['1K', '2K'], true)) {
+                // invalid value -> drop it
+                $imageSize = null;
             }
         }
 
-        // Otherwise, leave as-is (might contain image_url)
+        $payload = [
+            'instances' => [
+                ['prompt' => $englishPrompt]
+            ],
+            'parameters' => [
+                // use `sampleCount` per the example; we also accept `numberOfImages` from client
+                'sampleCount' => $sampleCount,
+                'aspectRatio' => $aspectRatio,
+                'personGeneration' => $pg,
+            ]
+        ];
+
+        if ($imageSize) {
+            $payload['parameters']['imageSize'] = $imageSize; // only 1K / 2K
+        }
+        // Add imageSize if provided (1K or 2K)
+        if (!empty($options['imageSize'])) {
+            $payload['parameters']['imageSize'] = $options['imageSize'];
+        }
+        $model = 'imagen-4.0-generate-001'; // Use Imagen model
+        $uri = '/models/' . $model . ':predict';
+        $response = $this->post($uri, $payload);
+        $formatted = $this->formatResponse($response);
+
+        // If the API returned image data, save it and return metadata
+        if ($formatted['success'] && isset($formatted['payload']['predictions'])) {
+            $images = [];
+            foreach ($formatted['payload']['predictions'] as $prediction) {
+                if (isset($prediction['bytesBase64Encoded'])) {
+                    $base64 = $prediction['bytesBase64Encoded'];
+                    $saved = $this->saveGeneratedImage($base64, $userPrompt, $model);
+                    if ($saved['success']) {
+                        $images[] = $saved['image'];
+                    }
+                }
+            }
+            if (!empty($images)) {
+                $formatted['payload']['saved_images'] = $images;
+            }
+        }
+
         return $formatted;
     }
 
@@ -281,6 +330,8 @@ class GoogleGeminiService
             'path' => $path,
             'original_prompt' => $originalPrompt,
             'model' => $model,
+            // Imagen always includes a SynthID watermark in created images
+            'has_synthid_watermark' => true,
             'size' => $size,
             'created_at' => now()->toDateTimeString(),
         ];
@@ -321,8 +372,10 @@ class GoogleGeminiService
         $filename = $id . '.png';
         $path = $dir . '/' . $filename;
 
+        // Convert whatever we received into PNG bytes to guarantee uniform storage
+        $pngBytes = $this->ensurePngBytes($bytes);
         $filePath = storage_path('app/' . $path);
-        file_put_contents($filePath, $bytes);
+        file_put_contents($filePath, $pngBytes);
         $size = filesize($filePath);
 
         $meta = $this->loadImageMetadata();
@@ -353,6 +406,51 @@ class GoogleGeminiService
         $this->saveImageMetadata($meta);
 
         return ['success' => true, 'status' => 201, 'image' => $entry];
+    }
+
+    /**
+     * Ensure the provided bytes represent a PNG image. If we can decode into an image
+     * resource we re-encode as PNG; otherwise fall back to the original bytes.
+     */
+    protected function ensurePngBytes(string $bytes): string
+    {
+        // quick check for a PNG header
+        if (strncmp($bytes, "\x89PNG\r\n\x1a\n", 8) === 0) {
+            return $bytes; // already PNG
+        }
+
+        // Attempt to create an image resource from the bytes
+        if (function_exists('imagecreatefromstring')) {
+            $im = @imagecreatefromstring($bytes);
+            if ($im !== false) {
+                ob_start();
+                // Re-encode as PNG for consistent storage
+                imagepng($im);
+                imagedestroy($im);
+                $png = ob_get_clean();
+                if ($png !== false && strlen($png) > 0) {
+                    return $png;
+                }
+            }
+        }
+
+        // Fallback to returning original bytes if conversion not possible
+        return $bytes;
+    }
+
+    public function listSavedImages(): array
+    {
+        $meta = $this->loadImageMetadata();
+        return ['success' => true, 'status' => 200, 'images' => $meta];
+    }
+
+    public function getSavedImageById(string $id): ?array
+    {
+        $meta = $this->loadImageMetadata();
+        foreach ($meta as $e) {
+            if ($e['id'] === $id) return $e;
+        }
+        return null;
     }
 
     protected function loadImageMetadata(): array
@@ -408,18 +506,25 @@ class GoogleGeminiService
         file_put_contents($path, json_encode($meta, JSON_PRETTY_PRINT));
     }
 
-    protected function wrapPromptForChannel(string $prompt, string $channel): string
+    protected function translateToEnglish(string $text): string
     {
-        $channel = Str::lower($channel);
-        $wrapper = "Responde siempre en español. ";
-        $wrapper .= "Act as a professional social media content writer. Create a post for: {$channel}. Use the following instructions and craft a suitable post: \n";
-        $wrapper .= "User instructions: {$prompt}";
-        return $wrapper;
+        // If the text is already in English, return as-is (simple check)
+        if (preg_match('/^[a-zA-Z\s\.,!?\'"-]+$/', $text) && !preg_match('/(el|la|los|las|un|una|es|son|está|están)/i', $text)) {
+            return $text;
+        }
+        // Otherwise, translate using Gemini
+        $translationPrompt = "Translate the following text to English. Only return the translated text, nothing else: " . $text;
+        $result = $this->generateText($translationPrompt, 'generic', []);
+        if ($result['success']) {
+            return trim($result['payload']['candidates'][0]['content']['parts'][0]['text'] ?? $text);
+        }
+        return $text; // Fallback
     }
 
     protected function wrapPromptForImage(string $prompt, array $options = []): string
     {
-        return "Responde siempre en español. Genera una imagen basada en estas instrucciones: " . $prompt;
+        // Imagen requires English prompts, so return as-is
+        return $prompt;
     }
 
     protected function wrapPromptForAudio(string $prompt, array $options = []): string
@@ -430,5 +535,35 @@ class GoogleGeminiService
     protected function wrapPromptForVideo(string $prompt, array $options = []): string
     {
         return "Responde siempre en español. Genera un guión corto de video y direcciones visuales basadas en: " . $prompt;
+    }
+
+    /**
+     * Map a channel name to a text prompt wrapper.
+     *
+     * The controller sends channel names like `facebook`, `instagram` and `podcast`.
+     * This helper ensures generateText has a consistent starting instruction
+     * and applies small, channel-specific guidance.
+     */
+    protected function wrapPromptForChannel(string $prompt, string $channel = 'generic'): string
+    {
+        $base = "Responde siempre en español.";
+
+        switch (strtolower($channel)) {
+            case 'facebook':
+                // short conversational posts, engaging tone
+                return $base . " Escribe una publicación corta y atractiva para Facebook basada en: " . $prompt;
+
+            case 'instagram':
+                // captions + relevant hashtags
+                return $base . " Escribe un pie de foto para Instagram (breve, con emojis y algunos hashtags) basado en: " . $prompt;
+
+            case 'podcast':
+                // longer form, show notes / segment script
+                return $base . " Escribe un guión o descripción para un episodio de podcast (un par de párrafos) basado en: " . $prompt;
+
+            default:
+                // generic text generation
+                return $base . " " . $prompt;
+        }
     }
 }

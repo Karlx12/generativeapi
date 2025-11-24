@@ -9,6 +9,9 @@ Route::prefix('v1')->group(function () {
         Route::post('instagram', [GenerativeController::class, 'generateInstagram']);
         Route::post('podcast', [GenerativeController::class, 'generatePodcast']);
         Route::post('image', [GenerativeController::class, 'generateImage']); # Falta validar con una cuenta Tier 1
+        Route::get('image/list', [GenerativeController::class, 'listImages']);
+        Route::post('image/send', [GenerativeController::class, 'sendImage']);
+        Route::get('image/{id}', [GenerativeController::class, 'downloadImage']);
         Route::post('audio', [GenerativeController::class, 'generateAudio']);
         Route::get('audio/list', [GenerativeController::class, 'listAudios']);
         Route::post('audio/send', [GenerativeController::class, 'sendAudio']);
