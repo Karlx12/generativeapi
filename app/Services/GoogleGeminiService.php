@@ -14,17 +14,16 @@ class GoogleGeminiService
 
     public function __construct()
     {
-    // Support both GOOGLE_API_KEY and GEMINI_API_KEY environment variable names
-    $this->apiKey = config('generative.google_api_key') ?: env('GOOGLE_API_KEY') ?: env('GEMINI_API_KEY') ?: '';
+        // Support both GOOGLE_API_KEY and GEMINI_API_KEY environment variable names
+        $this->apiKey = config('generative.google_api_key') ?: env('GOOGLE_API_KEY') ?: env('GEMINI_API_KEY') ?: '';
         $this->baseUrl = config('generative.google_base_url', 'https://generativelanguage.googleapis.com/v1beta');
-    $this->model = config('generative.google_model') ?: env('GEMINI_MODEL') ?: '';
+        $this->model = config('generative.google_model') ?: env('GEMINI_MODEL') ?: '';
     }
 
     public function generateText(string $userPrompt, string $channel = 'generic', array $options = []): array
     {
         $wrapped = $this->wrapPromptForChannel($userPrompt, $channel);
 
-        // Add tone and length into the text itself instead of top-level options
         $tone = $options['tone'] ?? null;
         $length = $options['length'] ?? null;
         if ($tone) {
@@ -34,7 +33,6 @@ class GoogleGeminiService
             $wrapped .= "\nLength: {$length}.";
         }
 
-        // Build payload with only allowed top-level fields to avoid invalid fields being sent
         $payload = [
             'contents' => [
                 [
@@ -45,7 +43,23 @@ class GoogleGeminiService
             ]
         ];
 
-    $model = $options['model'] ?? $this->model;
+        // ✅ AGREGAR ESTO: Desactivar modo pensamiento
+        $model = $options['model'] ?? $this->model;
+
+        // Si es gemini-2.5, agregar configuración para reducir tokens
+        // Si es gemini-2.5, desactivar thinking y limitar tokens
+        if (str_contains($model, 'gemini-2.5')) {
+            $payload['generationConfig'] = [
+                'temperature' => 0.7,
+                'maxOutputTokens' => 1024,
+                'topP' => 0.9,
+                'topK' => 40,
+                'thinkingConfig' => [
+                    'thinkingBudget' => 0  // ← Desactiva el pensamiento
+                ]
+            ];
+        }
+
         if (empty($model)) {
             return [
                 'success' => false,
@@ -53,6 +67,7 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
+
         $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
 
@@ -177,7 +192,7 @@ class GoogleGeminiService
         $wrapped = $this->wrapPromptForAudio($userPrompt, $options);
         $payload = [
             'contents' => [[
-                'parts' => [[ 'text' => $wrapped ]]
+                'parts' => [['text' => $wrapped]]
             ]]
         ];
         // Generation config to ensure the model returns audio and optionally uses a voice
@@ -202,8 +217,8 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
-    // Use the generic generateContent endpoint for audio modality
-    $uri = '/models/' . $model . ':generateContent';
+        // Use the generic generateContent endpoint for audio modality
+        $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
         $formatted = $this->formatResponse($response);
 
@@ -226,7 +241,7 @@ class GoogleGeminiService
         $wrapped = $this->wrapPromptForVideo($userPrompt, $options);
         $payload = [
             'contents' => [[
-                'parts' => [[ 'text' => $wrapped ]]
+                'parts' => [['text' => $wrapped]]
             ]]
         ];
         // Ensure the video generation returns VIDEO modality (if supported by model)
@@ -244,8 +259,8 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
-    // Use the generic generateContent endpoint for video modality
-    $uri = '/models/' . $model . ':generateContent';
+        // Use the generic generateContent endpoint for video modality
+        $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
         return $this->formatResponse($response);
     }
@@ -264,12 +279,17 @@ class GoogleGeminiService
 
         $url = rtrim($this->baseUrl, '/') . $uri;
 
-        // Use x-goog-api-key header as in the example curl usage
-        $response = Http::withHeaders([
+        // ✅ AGREGAR ESTO: Desactivar verificación SSL en desarrollo
+        $httpClient = Http::withHeaders([
             'x-goog-api-key' => $token,
-        ])
-            ->acceptJson()
-            ->post($url, $payload);
+        ])->acceptJson();
+
+        // Solo en desarrollo local
+        if (config('app.env') === 'local') {
+            $httpClient = $httpClient->withoutVerifying();
+        }
+
+        $response = $httpClient->post($url, $payload);
 
         if (! $response->successful()) {
             return [
@@ -318,10 +338,10 @@ class GoogleGeminiService
         $filename = $id . '.pcm';
         $path = $dir . '/' . $filename;
 
-    // Use direct file write to ensure storage in testing environment
-    $filePath = storage_path('app/' . $path);
-    file_put_contents($filePath, $bytes);
-    $size = filesize($filePath);
+        // Use direct file write to ensure storage in testing environment
+        $filePath = storage_path('app/' . $path);
+        file_put_contents($filePath, $bytes);
+        $size = filesize($filePath);
 
         $meta = $this->loadAudioMetadata();
         $entry = [
@@ -363,7 +383,8 @@ class GoogleGeminiService
             return ['success' => false, 'status' => 400, 'body' => 'Invalid base64 image data'];
         }
 
-        $dir = 'images';
+        // ✅ CAMBIO: Guardar en public/images en lugar de images
+        $dir = 'public/images';  // ← Era 'images'
         if (! Storage::exists($dir)) {
             Storage::makeDirectory($dir);
         }
@@ -372,17 +393,21 @@ class GoogleGeminiService
         $filename = $id . '.png';
         $path = $dir . '/' . $filename;
 
-        // Convert whatever we received into PNG bytes to guarantee uniform storage
+        // Convert to PNG
         $pngBytes = $this->ensurePngBytes($bytes);
         $filePath = storage_path('app/' . $path);
         file_put_contents($filePath, $pngBytes);
         $size = filesize($filePath);
 
+        // ✅ NUEVO: Generar URL pública
+        $publicUrl = url('storage/images/' . $filename);
+
         $meta = $this->loadImageMetadata();
         $entry = [
             'id' => $id,
             'filename' => $filename,
-            'path' => $path,
+            'path' => $path,  // storage/app/public/images/abc123.png
+            'url' => $publicUrl,  // ✅ NUEVO: https://api.incadev.com/storage/images/abc123.png
             'original_prompt' => $originalPrompt,
             'model' => $model,
             'size' => $size,
@@ -390,12 +415,11 @@ class GoogleGeminiService
         ];
 
         $meta[] = $entry;
-        // sort by created_at ascending
         usort($meta, function ($a, $b) {
             return strtotime($a['created_at']) <=> strtotime($b['created_at']);
         });
 
-        // enforce limit 50
+        // Enforce limit 50
         while (count($meta) > 50) {
             $oldest = array_shift($meta);
             if (!empty($oldest['path']) && Storage::exists($oldest['path'])) {
@@ -455,7 +479,8 @@ class GoogleGeminiService
 
     protected function loadImageMetadata(): array
     {
-        $path = storage_path('app/images/metadata.json');
+        // ✅ CAMBIO: Nueva ubicación del metadata
+        $path = storage_path('app/public/images/metadata.json');
         if (!file_exists($path)) return [];
         $json = file_get_contents($path);
         $data = json_decode($json, true);
@@ -464,7 +489,8 @@ class GoogleGeminiService
 
     protected function saveImageMetadata(array $meta): void
     {
-        $dir = storage_path('app/images');
+        // ✅ CAMBIO: Nueva ubicación del metadata
+        $dir = storage_path('app/public/images');
         if (! is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
@@ -550,20 +576,55 @@ class GoogleGeminiService
 
         switch (strtolower($channel)) {
             case 'facebook':
-                // short conversational posts, engaging tone
-                return $base . " Escribe una publicación corta y atractiva para Facebook basada en: " . $prompt;
+                // ✅ Más específico y directo
+                return $base . " Escribe un post que este listo para copiar y pegar en una publicación de Facebook de máximo 3 párrafos cortos que contentan emojis y hashtags sobre: " . $prompt;
 
             case 'instagram':
-                // captions + relevant hashtags
-                return $base . " Escribe un pie de foto para Instagram (breve, con emojis y algunos hashtags) basado en: " . $prompt;
+            return $base . 
+                " Crea un caption para Instagram de máximo 150 caracteres. " .
+                "Incluye emojis y exactamente entre 3 y 5 hashtags. " .
+                "Debe ser atractivo, conciso y pensado para captar atención en scroll. " .
+                "Tema: " . $prompt;
 
             case 'podcast':
-                // longer form, show notes / segment script
-                return $base . " Escribe un guión o descripción para un episodio de podcast (un par de párrafos) basado en: " . $prompt;
+                return $base . " Escribe un guión de podcast de 2-3 párrafos sobre: " . $prompt;
 
             default:
-                // generic text generation
                 return $base . " " . $prompt;
         }
+    }
+
+    public function listSavedVideos(): array
+    {
+        $meta = $this->loadVideoMetadata();
+        return ['success' => true, 'status' => 200, 'videos' => $meta];
+    }
+
+    public function getSavedVideoById(string $id): ?array
+    {
+        $meta = $this->loadVideoMetadata();
+        foreach ($meta as $e) {
+            if ($e['id'] === $id) return $e;
+        }
+        return null;
+    }
+
+    protected function loadVideoMetadata(): array
+    {
+        $path = storage_path('app/videos/metadata.json');
+        if (!file_exists($path)) return [];
+        $json = file_get_contents($path);
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : [];
+    }
+
+    protected function saveVideoMetadata(array $meta): void
+    {
+        $dir = storage_path('app/videos');
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        $path = $dir . '/metadata.json';
+        file_put_contents($path, json_encode($meta, JSON_PRETTY_PRINT));
     }
 }
