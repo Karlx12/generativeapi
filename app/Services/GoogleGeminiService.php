@@ -14,17 +14,16 @@ class GoogleGeminiService
 
     public function __construct()
     {
-    // Support both GOOGLE_API_KEY and GEMINI_API_KEY environment variable names
-    $this->apiKey = config('generative.google_api_key') ?: env('GOOGLE_API_KEY') ?: env('GEMINI_API_KEY') ?: '';
+        // Support both GOOGLE_API_KEY and GEMINI_API_KEY environment variable names
+        $this->apiKey = config('generative.google_api_key') ?: env('GOOGLE_API_KEY') ?: env('GEMINI_API_KEY') ?: '';
         $this->baseUrl = config('generative.google_base_url', 'https://generativelanguage.googleapis.com/v1beta');
-    $this->model = config('generative.google_model') ?: env('GEMINI_MODEL') ?: '';
+        $this->model = config('generative.google_model') ?: env('GEMINI_MODEL') ?: '';
     }
 
     public function generateText(string $userPrompt, string $channel = 'generic', array $options = [], ?string $linkUrl = null): array
     {
         $wrapped = $this->wrapPromptForChannel($userPrompt, $channel);
 
-        // Add tone and length into the text itself instead of top-level options
         $tone = $options['tone'] ?? null;
         $length = $options['length'] ?? null;
         if ($tone) {
@@ -34,7 +33,6 @@ class GoogleGeminiService
             $wrapped .= "\nLength: {$length}.";
         }
 
-        // Build payload with only allowed top-level fields to avoid invalid fields being sent
         $payload = [
             'contents' => [
                 [
@@ -45,7 +43,23 @@ class GoogleGeminiService
             ]
         ];
 
-    $model = $options['model'] ?? $this->model;
+        // ✅ AGREGAR ESTO: Desactivar modo pensamiento
+        $model = $options['model'] ?? $this->model;
+
+        // Si es gemini-2.5, agregar configuración para reducir tokens
+        // Si es gemini-2.5, desactivar thinking y limitar tokens
+        if (str_contains($model, 'gemini-2.5')) {
+            $payload['generationConfig'] = [
+                'temperature' => 0.7,
+                'maxOutputTokens' => 1024,
+                'topP' => 0.9,
+                'topK' => 40,
+                'thinkingConfig' => [
+                    'thinkingBudget' => 0  // ← Desactiva el pensamiento
+                ]
+            ];
+        }
+
         if (empty($model)) {
             return [
                 'success' => false,
@@ -53,6 +67,7 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
+
         $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
 
@@ -113,8 +128,10 @@ class GoogleGeminiService
 
     public function generateImage(string $userPrompt, array $options = []): array
     {
+        set_time_limit(300);
         // Translate prompt to English if necessary, using Gemini
-        $englishPrompt = $this->translateToEnglish($userPrompt);
+        // ✅ DESPUÉS
+$enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
         // Imagen only supports English prompts
 
         // Support both `numberOfImages` and `sampleCount` as input. Clamp to 1..4
@@ -122,7 +139,7 @@ class GoogleGeminiService
         $sampleCount = is_numeric($requested) ? (int)$requested : null;
         if (is_null($sampleCount)) {
             // Imagen default is 4
-            $sampleCount = 4;
+            $sampleCount = 1;
         }
         // enforce allowed range 1-4
         $sampleCount = max(1, min(4, $sampleCount));
@@ -153,7 +170,7 @@ class GoogleGeminiService
 
         $payload = [
             'instances' => [
-                ['prompt' => $englishPrompt]
+                ['prompt' => $enrichedPrompt]
             ],
             'parameters' => [
                 // use `sampleCount` per the example; we also accept `numberOfImages` from client
@@ -181,7 +198,7 @@ class GoogleGeminiService
             foreach ($formatted['payload']['predictions'] as $prediction) {
                 if (isset($prediction['bytesBase64Encoded'])) {
                     $base64 = $prediction['bytesBase64Encoded'];
-                    $saved = $this->saveGeneratedImage($base64, $userPrompt, $model);
+                    $saved = $this->saveGeneratedImage($base64, $enrichedPrompt, $model);
                     if ($saved['success']) {
                         $images[] = $saved['image'];
                     }
@@ -200,7 +217,7 @@ class GoogleGeminiService
         $wrapped = $this->wrapPromptForAudio($userPrompt, $options);
         $payload = [
             'contents' => [[
-                'parts' => [[ 'text' => $wrapped ]]
+                'parts' => [['text' => $wrapped]]
             ]]
         ];
         // Generation config to ensure the model returns audio and optionally uses a voice
@@ -225,8 +242,8 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
-    // Use the generic generateContent endpoint for audio modality
-    $uri = '/models/' . $model . ':generateContent';
+        // Use the generic generateContent endpoint for audio modality
+        $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
         $formatted = $this->formatResponse($response);
 
@@ -249,7 +266,7 @@ class GoogleGeminiService
         $wrapped = $this->wrapPromptForVideo($userPrompt, $options);
         $payload = [
             'contents' => [[
-                'parts' => [[ 'text' => $wrapped ]]
+                'parts' => [['text' => $wrapped]]
             ]]
         ];
         // Ensure the video generation returns VIDEO modality (if supported by model)
@@ -267,8 +284,8 @@ class GoogleGeminiService
                 'body' => 'Missing GEMINI_MODEL configuration. Set GEMINI_MODEL in .env or pass `model` in request body.'
             ];
         }
-    // Use the generic generateContent endpoint for video modality
-    $uri = '/models/' . $model . ':generateContent';
+        // Use the generic generateContent endpoint for video modality
+        $uri = '/models/' . $model . ':generateContent';
         $response = $this->post($uri, $payload);
         return $this->formatResponse($response);
     }
@@ -287,12 +304,19 @@ class GoogleGeminiService
 
         $url = rtrim($this->baseUrl, '/') . $uri;
 
-        // Use x-goog-api-key header as in the example curl usage
-        $response = Http::withHeaders([
+        // ✅ AGREGAR ESTO: Desactivar verificación SSL en desarrollo
+        $httpClient = Http::withHeaders([
             'x-goog-api-key' => $token,
         ])
-            ->acceptJson()
-            ->post($url, $payload);
+            ->timeout(300) // ← AGREGAR ESTO
+            ->acceptJson();
+
+        // Solo en desarrollo local
+        if (config('app.env') === 'local') {
+            $httpClient = $httpClient->withoutVerifying();
+        }
+
+        $response = $httpClient->post($url, $payload);
 
         if (! $response->successful()) {
             return [
@@ -341,10 +365,10 @@ class GoogleGeminiService
         $filename = $id . '.pcm';
         $path = $dir . '/' . $filename;
 
-    // Use direct file write to ensure storage in testing environment
-    $filePath = storage_path('app/' . $path);
-    file_put_contents($filePath, $bytes);
-    $size = filesize($filePath);
+        // Use direct file write to ensure storage in testing environment
+        $filePath = storage_path('app/' . $path);
+        file_put_contents($filePath, $bytes);
+        $size = filesize($filePath);
 
         $meta = $this->loadAudioMetadata();
         $entry = [
@@ -386,26 +410,32 @@ class GoogleGeminiService
             return ['success' => false, 'status' => 400, 'body' => 'Invalid base64 image data'];
         }
 
-        $dir = 'images';
-        if (! Storage::exists($dir)) {
-            Storage::makeDirectory($dir);
+        // ✅ CAMBIO: Guardar en public/images en lugar de images
+        $dir = 'public/images';  // ← Era 'images'
+        $fullPath = storage_path('app/' . $dir);
+        if (!is_dir($fullPath)) {
+            mkdir($fullPath, 0755, true);
         }
 
         $id = Str::random(12);
         $filename = $id . '.png';
         $path = $dir . '/' . $filename;
 
-        // Convert whatever we received into PNG bytes to guarantee uniform storage
+        // Convert to PNG
         $pngBytes = $this->ensurePngBytes($bytes);
         $filePath = storage_path('app/' . $path);
         file_put_contents($filePath, $pngBytes);
         $size = filesize($filePath);
 
+        // ✅ NUEVO: Generar URL pública
+        $publicUrl = url('storage/images/' . $filename);
+
         $meta = $this->loadImageMetadata();
         $entry = [
             'id' => $id,
             'filename' => $filename,
-            'path' => $path,
+            'path' => $path,  // storage/app/public/images/abc123.png
+            'url' => $publicUrl,  // ✅ NUEVO: https://api.incadev.com/storage/images/abc123.png
             'original_prompt' => $originalPrompt,
             'model' => $model,
             'size' => $size,
@@ -413,12 +443,11 @@ class GoogleGeminiService
         ];
 
         $meta[] = $entry;
-        // sort by created_at ascending
         usort($meta, function ($a, $b) {
             return strtotime($a['created_at']) <=> strtotime($b['created_at']);
         });
 
-        // enforce limit 50
+        // Enforce limit 50
         while (count($meta) > 50) {
             $oldest = array_shift($meta);
             if (!empty($oldest['path']) && Storage::exists($oldest['path'])) {
@@ -478,7 +507,8 @@ class GoogleGeminiService
 
     protected function loadImageMetadata(): array
     {
-        $path = storage_path('app/images/metadata.json');
+        // ✅ CAMBIO: Nueva ubicación del metadata
+        $path = storage_path('app/public/images/metadata.json');
         if (!file_exists($path)) return [];
         $json = file_get_contents($path);
         $data = json_decode($json, true);
@@ -487,7 +517,8 @@ class GoogleGeminiService
 
     protected function saveImageMetadata(array $meta): void
     {
-        $dir = storage_path('app/images');
+        // ✅ CAMBIO: Nueva ubicación del metadata
+        $dir = storage_path('app/public/images');
         if (! is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
@@ -544,6 +575,102 @@ class GoogleGeminiService
         return $text; // Fallback
     }
 
+    /**
+ * Enrich a user prompt with educational/promotional context for better image generation
+ * 
+ * Transforms simple prompts like:
+ * - "Python" → detailed educational scene
+ * - "Curso Python" → attractive course promotion
+ * - "Promoción Curso Python 20%" → discount promotional image
+ */
+protected function enrichPromptForEducation(string $userPrompt): string
+{
+    // First translate to English if needed
+    $englishPrompt = $this->translateToEnglish($userPrompt);
+    
+    // Create a meta-prompt to enhance the original prompt
+    $enhancementPrompt = "You are an expert in creating visual prompts for educational marketing images. 
+
+Based on this user input: \"{$englishPrompt}\"
+
+Analyze the intent and create a detailed, visual image prompt following these rules:
+
+1. If it mentions 'course' or 'curso' → Create a professional educational promotion showing:
+   - Modern classroom or online learning environment
+   - Students or professionals engaged with the topic
+   - Clean, professional aesthetic with bright, inviting colors
+   - Visible technology (laptops, tablets, screens)
+   - Include subtle educational elements (books, certificates, graduation caps)
+
+2. If it mentions 'promotion', 'discount', 'promoción', or percentage → Create an attention-grabbing promotional image with:
+   - Bold, vibrant colors (blues, greens, oranges)
+   - Clear visual hierarchy
+   - Modern, dynamic composition
+   - Professional but energetic vibe
+   - Tech-forward aesthetic
+
+3. If it's just a topic/subject (like 'Python', 'Excel', 'Marketing') → Create an informative educational image showing:
+   - Visual representation of the subject in action
+   - Modern, professional learning environment
+   - Bright, welcoming atmosphere
+   - Technology and innovation focus
+   - Clean, minimalist composition
+
+4. ALWAYS include these elements:
+   - Professional photography style or modern digital illustration
+   - Bright, natural or studio lighting
+   - High quality, sharp details
+   - Educational context (laptops, screens, modern classroom, online learning setup)
+   - Appealing to young adults and professionals (age 18-45)
+   - Latin American or diverse representation when showing people
+   - Modern, tech-savvy aesthetic
+
+5. Output format requirements:
+   - Write in English (required for image generation)
+   - Maximum 2 sentences
+   - Focus on VISUAL elements only
+   - Be specific about colors, composition, lighting, and style
+   - No abstract concepts, only concrete visual descriptions
+
+Return ONLY the enhanced visual prompt, nothing else. No explanations, no markdown, just the prompt text.";
+
+    // Call Gemini to enhance the prompt
+    $payload = [
+        'contents' => [[
+            'parts' => [['text' => $enhancementPrompt]]
+        ]],
+        'generationConfig' => [
+            'temperature' => 0.8,
+            'maxOutputTokens' => 200,
+            'topP' => 0.9,
+            'topK' => 40,
+        ]
+    ];
+
+    $model = $this->model;
+    if (empty($model)) {
+        // Fallback to basic translation if no model configured
+        return $englishPrompt;
+    }
+
+    $uri = '/models/' . $model . ':generateContent';
+    $response = $this->post($uri, $payload);
+
+    if ($response['success'] && isset($response['data']['candidates'][0]['content']['parts'][0]['text'])) {
+        $enhancedPrompt = trim($response['data']['candidates'][0]['content']['parts'][0]['text']);
+        
+        // Clean up any markdown or extra formatting
+        $enhancedPrompt = preg_replace('/```.*?```/s', '', $enhancedPrompt);
+        $enhancedPrompt = preg_replace('/^["\']+|["\']+$/', '', $enhancedPrompt);
+        $enhancedPrompt = trim($enhancedPrompt);
+        
+        return $enhancedPrompt;
+    }
+
+    // Fallback to original English translation if enhancement fails
+    return $englishPrompt;
+}
+
     protected function wrapPromptForImage(string $prompt, array $options = []): string
     {
         // Imagen requires English prompts, so return as-is
@@ -573,126 +700,55 @@ class GoogleGeminiService
 
         switch (strtolower($channel)) {
             case 'facebook':
-                // short conversational posts, engaging tone
-                    return $base . " Responde en texto plano, sin Markdown ni URL. Puedes usar emojis. Escribe una publicación corta y atractiva para Facebook basada en: " . $prompt;
+                // ✅ Más específico y directo
+                return $base . " Escribe un post que este listo para copiar y pegar en una publicación de Facebook de máximo 3 párrafos cortos que contentan emojis y hashtags sobre: " . $prompt;
 
             case 'instagram':
-                // captions + relevant hashtags
-                    return $base . " Escribe un pie de foto para Instagram (breve, con emojis y algunos hashtags) basado en: " . $prompt;
+                return $base .
+                    " Crea un caption para Instagram de máximo 150 caracteres. " .
+                    "Incluye emojis y exactamente entre 3 y 5 hashtags. " .
+                    "Debe ser atractivo, conciso y pensado para captar atención en scroll. " .
+                    "Tema: " . $prompt;
 
             case 'podcast':
-                // longer form, show notes / segment script
-                    return $base . " Escribe un guión o descripción para un episodio de podcast (un par de párrafos) basado en: " . $prompt;
+                return $base . " Escribe un guión de podcast de 2-3 párrafos sobre: " . $prompt;
 
             default:
-                // generic text generation
                 return $base . " " . $prompt;
         }
     }
 
-    /**
-     * Try to extract the primary textual candidate from the Gemini payload.
-     */
-    protected function extractFirstTextFromPayload(array $payload): ?string
+    public function listSavedVideos(): array
     {
-        // payload.candidates[].content.parts[].text (typical for generateContent)
-        if (!empty($payload['candidates']) && is_array($payload['candidates'])) {
-            $candidate = $payload['candidates'][0] ?? null;
-            if ($candidate && !empty($candidate['content']['parts']) && is_array($candidate['content']['parts'])) {
-                $texts = array_map(fn($p) => $p['text'] ?? '', $candidate['content']['parts']);
-                return trim(implode("\n", array_filter($texts)));
-            }
+        $meta = $this->loadVideoMetadata();
+        return ['success' => true, 'status' => 200, 'videos' => $meta];
+    }
+
+    public function getSavedVideoById(string $id): ?array
+    {
+        $meta = $this->loadVideoMetadata();
+        foreach ($meta as $e) {
+            if ($e['id'] === $id) return $e;
         }
-
-        // fallback: payload.text or generated_text
-        if (!empty($payload['text'])) return trim($payload['text']);
-        if (!empty($payload['generated_text'])) return trim($payload['generated_text']);
-
-        // some responses use payload.candidates[0].text
-        if (!empty($payload['candidates'][0]['text'])) return trim($payload['candidates'][0]['text']);
-
         return null;
     }
 
-    /**
-     * Clean the generated text removing assistant preambles, separators and replace link placeholder with provided link_url.
-     */
-    protected function cleanGeneratedText(string $raw, ?string $linkUrl = null, ?string $channel = null): string
+    protected function loadVideoMetadata(): array
     {
-        $text = $raw;
+        $path = storage_path('app/videos/metadata.json');
+        if (!file_exists($path)) return [];
+        $json = file_get_contents($path);
+        $data = json_decode($json, true);
+        return is_array($data) ? $data : [];
+    }
 
-        // If there is an explicit '---' separator, take everything after the last occurrence
-        if (preg_match('/-{3,}/', $text)) {
-            $parts = preg_split('/-{3,}/', $text);
-            $text = trim(end($parts));
-        } else {
-            // If the first paragraph looks like a preamble/greeting (contains 'Claro', 'Aquí tienes', 'publicación para'), drop it
-            $chunks = preg_split('/\r?\n\r?\n/', $text, 2);
-            if (count($chunks) === 2) {
-                $first = strtolower($chunks[0]);
-                if (str_contains($first, 'claro') || str_contains($first, 'aquí tienes') || str_contains($first, 'a continuaci') || str_contains($first, 'una publicación') || str_contains($first, 'publicación para') || str_contains($first, 'hola')) {
-                    $text = trim($chunks[1]);
-                }
-            }
+    protected function saveVideoMetadata(array $meta): void
+    {
+        $dir = storage_path('app/videos');
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
         }
-
-        // Replace common placeholder patterns like (tu enlace aquí), [Tu enlace aquí] or 'tu enlace aquí'
-        if (!empty($linkUrl)) {
-            $pattern = '/[\(\[]?\s*(tu enlace aquí|tu enlace)\s*[\)\]]?/ui';
-            $hadPlaceholder = preg_match($pattern, $text);
-            if ($hadPlaceholder) {
-                $text = preg_replace($pattern, $linkUrl, $text);
-            } else {
-                // if no placeholder present and the result doesn't already contain an URL, append a short link line
-                if (!preg_match('/https?:\/\//i', $text)) {
-                    $text = trim($text) . "\n\nMás información e inscripciones: " . $linkUrl;
-                }
-            }
-        } else {
-            // Remove any remaining placeholders if no link_url provided
-            $text = preg_replace('/[\(\[]?\s*(tu enlace aquí|tu enlace)\s*[\)\]]?/ui', '', $text);
-        }
-
-        // If this is for Facebook, remove Markdown artifacts and strip URLs (we require plain text/no URLs for Facebook)
-        if (strtolower((string)$channel) === 'facebook') {
-            // Remove Markdown artifacts (code fences, inline code, headings, emphasis, lists, bold/italic markers)
-        // 1) remove code fences ``` ``` blocks
-        $text = preg_replace('/```.*?```/s', '', $text);
-        // 2) remove inline backticks
-        $text = preg_replace('/`([^`]*)`/', '$1', $text);
-        // 3) remove markdown headings (# ...)
-        $text = preg_replace('/^#{1,6}\s*/m', '', $text);
-        // 4) remove bold/italic markers (**bold**, *italic*, __bold__, _italic_)
-        $text = preg_replace('/(\*\*|__)(.*?)\1/', '$2', $text);
-        $text = preg_replace('/(\*|_)(.*?)\1/', '$2', $text);
-        // 5) remove ordered/unordered list markers at line starts (e.g. '- ', '* ', '1. ')
-        $text = preg_replace('/^\s*[-\*+]\s+/m', '', $text);
-        $text = preg_replace('/^\s*\d+\.\s+/m', '', $text);
-
-        // Remove any stray horizontal rules
-        $text = preg_replace('/^-{3,}\s*$/m', '', $text);
-
-            // Remove any URLs left in the model output. If linkUrl was provided and we replaced/added it,
-            // preserve occurrences equal to $linkUrl but strip other URLs.
-            if (!empty($linkUrl)) {
-            // remove URLs except the exact $linkUrl
-            $text = preg_replace_callback('/https?:\/\/\S+/i', function ($m) use ($linkUrl) {
-                return strcasecmp($m[0], $linkUrl) === 0 ? $m[0] : '';
-            }, $text);
-        } else {
-            // remove any URL-like substrings
-            $text = preg_replace('/https?:\/\/\S+/i', '', $text);
-        }
-
-            // Collapse multiple blank lines
-            $text = preg_replace('/\n{3,}/', "\n\n", $text);
-        } else {
-            // For non-Facebook channels, only ensure we don't leave leftover placeholders; keep any URLs the model returned.
-            // Collapse extra blank lines regardless.
-            $text = preg_replace('/\n{3,}/', "\n\n", $text);
-        }
-
-        // Final trim and return
-        return trim($text);
+        $path = $dir . '/metadata.json';
+        file_put_contents($path, json_encode($meta, JSON_PRETTY_PRINT));
     }
 }
