@@ -5,6 +5,7 @@ namespace App\Services;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
 
 class GoogleGeminiService
 {
@@ -319,6 +320,13 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
         $response = $httpClient->post($url, $payload);
 
         if (! $response->successful()) {
+            // Log the full response for debugging (temporary)
+            Log::error('Gemini API request failed', [
+                'url' => $url,
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
             return [
                 'success' => false,
                 'status' => $response->status(),
@@ -346,6 +354,57 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
             'status' => $resp['status'] ?? 200,
             'payload' => $data,
         ];
+    }
+
+    /**
+     * Extract the most likely textual candidate from Gemini payloads.
+     */
+    protected function extractFirstTextFromPayload(array $payload): string
+    {
+        if (isset($payload['candidates']) && is_array($payload['candidates'])) {
+            foreach ($payload['candidates'] as $candidate) {
+                if (isset($candidate['content']['parts']) && is_array($candidate['content']['parts'])) {
+                    foreach ($candidate['content']['parts'] as $part) {
+                        if (!empty($part['text'])) {
+                            return trim($part['text']);
+                        }
+                    }
+                }
+
+                if (isset($candidate['content']) && is_array($candidate['content'])) {
+                    foreach ($candidate['content'] as $c) {
+                        if (!empty($c['text'])) {
+                            return trim($c['text']);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: try common paths
+        if (isset($payload['candidates'][0]['content']['parts'][0]['text'])) {
+            return trim($payload['candidates'][0]['content']['parts'][0]['text']);
+        }
+
+        return '';
+    }
+
+    /**
+     * Basic cleaning of generated text: trim, normalize whitespace, optionally append link.
+     */
+    protected function cleanGeneratedText(string $rawText, ?string $linkUrl = null, string $channel = 'generic'): string
+    {
+        $text = preg_replace('/\s+/', ' ', trim($rawText));
+
+        // Remove leading/trailing quotes and extra whitespace
+        $text = preg_replace('/^["\']+|["\']+$/', '', $text);
+
+        if (!empty($linkUrl) && strpos($text, $linkUrl) === false) {
+            // For short social copy append the link at the end
+            $text .= "\n\n" . $linkUrl;
+        }
+
+        return trim($text);
     }
 
     // Save audio bytes and metadata, keep up to 20 files
