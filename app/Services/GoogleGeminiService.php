@@ -105,8 +105,10 @@ class GoogleGeminiService
 
     public function generateImage(string $userPrompt, array $options = []): array
     {
+        set_time_limit(300);
         // Translate prompt to English if necessary, using Gemini
-        $englishPrompt = $this->translateToEnglish($userPrompt);
+        // ✅ DESPUÉS
+$enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
         // Imagen only supports English prompts
 
         // Support both `numberOfImages` and `sampleCount` as input. Clamp to 1..4
@@ -114,7 +116,7 @@ class GoogleGeminiService
         $sampleCount = is_numeric($requested) ? (int)$requested : null;
         if (is_null($sampleCount)) {
             // Imagen default is 4
-            $sampleCount = 4;
+            $sampleCount = 1;
         }
         // enforce allowed range 1-4
         $sampleCount = max(1, min(4, $sampleCount));
@@ -145,7 +147,7 @@ class GoogleGeminiService
 
         $payload = [
             'instances' => [
-                ['prompt' => $englishPrompt]
+                ['prompt' => $enrichedPrompt]
             ],
             'parameters' => [
                 // use `sampleCount` per the example; we also accept `numberOfImages` from client
@@ -173,7 +175,7 @@ class GoogleGeminiService
             foreach ($formatted['payload']['predictions'] as $prediction) {
                 if (isset($prediction['bytesBase64Encoded'])) {
                     $base64 = $prediction['bytesBase64Encoded'];
-                    $saved = $this->saveGeneratedImage($base64, $userPrompt, $model);
+                    $saved = $this->saveGeneratedImage($base64, $enrichedPrompt, $model);
                     if ($saved['success']) {
                         $images[] = $saved['image'];
                     }
@@ -282,7 +284,9 @@ class GoogleGeminiService
         // ✅ AGREGAR ESTO: Desactivar verificación SSL en desarrollo
         $httpClient = Http::withHeaders([
             'x-goog-api-key' => $token,
-        ])->acceptJson();
+        ])
+            ->timeout(300) // ← AGREGAR ESTO
+            ->acceptJson();
 
         // Solo en desarrollo local
         if (config('app.env') === 'local') {
@@ -385,8 +389,9 @@ class GoogleGeminiService
 
         // ✅ CAMBIO: Guardar en public/images en lugar de images
         $dir = 'public/images';  // ← Era 'images'
-        if (! Storage::exists($dir)) {
-            Storage::makeDirectory($dir);
+        $fullPath = storage_path('app/' . $dir);
+        if (!is_dir($fullPath)) {
+            mkdir($fullPath, 0755, true);
         }
 
         $id = Str::random(12);
@@ -547,6 +552,102 @@ class GoogleGeminiService
         return $text; // Fallback
     }
 
+    /**
+ * Enrich a user prompt with educational/promotional context for better image generation
+ * 
+ * Transforms simple prompts like:
+ * - "Python" → detailed educational scene
+ * - "Curso Python" → attractive course promotion
+ * - "Promoción Curso Python 20%" → discount promotional image
+ */
+protected function enrichPromptForEducation(string $userPrompt): string
+{
+    // First translate to English if needed
+    $englishPrompt = $this->translateToEnglish($userPrompt);
+    
+    // Create a meta-prompt to enhance the original prompt
+    $enhancementPrompt = "You are an expert in creating visual prompts for educational marketing images. 
+
+Based on this user input: \"{$englishPrompt}\"
+
+Analyze the intent and create a detailed, visual image prompt following these rules:
+
+1. If it mentions 'course' or 'curso' → Create a professional educational promotion showing:
+   - Modern classroom or online learning environment
+   - Students or professionals engaged with the topic
+   - Clean, professional aesthetic with bright, inviting colors
+   - Visible technology (laptops, tablets, screens)
+   - Include subtle educational elements (books, certificates, graduation caps)
+
+2. If it mentions 'promotion', 'discount', 'promoción', or percentage → Create an attention-grabbing promotional image with:
+   - Bold, vibrant colors (blues, greens, oranges)
+   - Clear visual hierarchy
+   - Modern, dynamic composition
+   - Professional but energetic vibe
+   - Tech-forward aesthetic
+
+3. If it's just a topic/subject (like 'Python', 'Excel', 'Marketing') → Create an informative educational image showing:
+   - Visual representation of the subject in action
+   - Modern, professional learning environment
+   - Bright, welcoming atmosphere
+   - Technology and innovation focus
+   - Clean, minimalist composition
+
+4. ALWAYS include these elements:
+   - Professional photography style or modern digital illustration
+   - Bright, natural or studio lighting
+   - High quality, sharp details
+   - Educational context (laptops, screens, modern classroom, online learning setup)
+   - Appealing to young adults and professionals (age 18-45)
+   - Latin American or diverse representation when showing people
+   - Modern, tech-savvy aesthetic
+
+5. Output format requirements:
+   - Write in English (required for image generation)
+   - Maximum 2 sentences
+   - Focus on VISUAL elements only
+   - Be specific about colors, composition, lighting, and style
+   - No abstract concepts, only concrete visual descriptions
+
+Return ONLY the enhanced visual prompt, nothing else. No explanations, no markdown, just the prompt text.";
+
+    // Call Gemini to enhance the prompt
+    $payload = [
+        'contents' => [[
+            'parts' => [['text' => $enhancementPrompt]]
+        ]],
+        'generationConfig' => [
+            'temperature' => 0.8,
+            'maxOutputTokens' => 200,
+            'topP' => 0.9,
+            'topK' => 40,
+        ]
+    ];
+
+    $model = $this->model;
+    if (empty($model)) {
+        // Fallback to basic translation if no model configured
+        return $englishPrompt;
+    }
+
+    $uri = '/models/' . $model . ':generateContent';
+    $response = $this->post($uri, $payload);
+
+    if ($response['success'] && isset($response['data']['candidates'][0]['content']['parts'][0]['text'])) {
+        $enhancedPrompt = trim($response['data']['candidates'][0]['content']['parts'][0]['text']);
+        
+        // Clean up any markdown or extra formatting
+        $enhancedPrompt = preg_replace('/```.*?```/s', '', $enhancedPrompt);
+        $enhancedPrompt = preg_replace('/^["\']+|["\']+$/', '', $enhancedPrompt);
+        $enhancedPrompt = trim($enhancedPrompt);
+        
+        return $enhancedPrompt;
+    }
+
+    // Fallback to original English translation if enhancement fails
+    return $englishPrompt;
+}
+
     protected function wrapPromptForImage(string $prompt, array $options = []): string
     {
         // Imagen requires English prompts, so return as-is
@@ -580,11 +681,11 @@ class GoogleGeminiService
                 return $base . " Escribe un post que este listo para copiar y pegar en una publicación de Facebook de máximo 3 párrafos cortos que contentan emojis y hashtags sobre: " . $prompt;
 
             case 'instagram':
-            return $base . 
-                " Crea un caption para Instagram de máximo 150 caracteres. " .
-                "Incluye emojis y exactamente entre 3 y 5 hashtags. " .
-                "Debe ser atractivo, conciso y pensado para captar atención en scroll. " .
-                "Tema: " . $prompt;
+                return $base .
+                    " Crea un caption para Instagram de máximo 150 caracteres. " .
+                    "Incluye emojis y exactamente entre 3 y 5 hashtags. " .
+                    "Debe ser atractivo, conciso y pensado para captar atención en scroll. " .
+                    "Tema: " . $prompt;
 
             case 'podcast':
                 return $base . " Escribe un guión de podcast de 2-3 párrafos sobre: " . $prompt;
