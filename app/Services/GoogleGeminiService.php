@@ -565,12 +565,36 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
 
     protected function loadImageMetadata(): array
     {
-        // ✅ CAMBIO: Nueva ubicación del metadata
-        $path = storage_path('app/public/images/metadata.json');
-        if (!file_exists($path)) return [];
-        $json = file_get_contents($path);
-        $data = json_decode($json, true);
-        return is_array($data) ? $data : [];
+        // Prefer the new metadata location under storage/app/public/images
+        $newPath = storage_path('app/public/images/metadata.json');
+        $legacyPath = storage_path('app/images/metadata.json');
+
+        // If the new path exists, use it
+        if (file_exists($newPath)) {
+            $json = file_get_contents($newPath);
+            $data = json_decode($json, true);
+            return is_array($data) ? $data : [];
+        }
+
+        // Fallback: support legacy metadata location (storage/app/images)
+        if (file_exists($legacyPath)) {
+            $json = file_get_contents($legacyPath);
+            $data = json_decode($json, true);
+            // Try to migrate legacy metadata into the new public/images location for future calls
+            try {
+                $dir = storage_path('app/public/images');
+                if (! is_dir($dir)) {
+                    mkdir($dir, 0755, true);
+                }
+                file_put_contents($dir . '/metadata.json', json_encode($data, JSON_PRETTY_PRINT));
+            } catch (\Throwable $e) {
+                // ignore migration errors; still return the legacy data
+            }
+
+            return is_array($data) ? $data : [];
+        }
+
+        return [];
     }
 
     protected function saveImageMetadata(array $meta): void
