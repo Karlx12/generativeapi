@@ -147,7 +147,7 @@ class GenerativeController extends Controller
             return response()->json(['success' => false, 'status' => 404, 'body' => 'Image file missing'], 404);
         }
 
-        $resp = response()->file($path, ['Content-Type' => mime_content_type($path)]);
+        $resp = response()->file($path, ['Content-Type' => 'image/jpeg']);
         $resp->headers->set('Access-Control-Allow-Origin', '*');
         $resp->headers->set('Access-Control-Allow-Methods', 'GET, OPTIONS');
         return $resp;
@@ -169,7 +169,7 @@ class GenerativeController extends Controller
             return response()->json(['success' => false, 'status' => 404, 'body' => 'Image file missing'], 404);
         }
 
-        $resp = response()->file($path, ['Content-Type' => mime_content_type($path)]);
+        $resp = response()->file($path, ['Content-Type' => 'image/jpeg']);
         $resp->headers->set('Access-Control-Allow-Origin', '*');
         $resp->headers->set('Access-Control-Allow-Methods', 'GET, OPTIONS');
         return $resp;

@@ -469,35 +469,33 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
             return ['success' => false, 'status' => 400, 'body' => 'Invalid base64 image data'];
         }
 
-        // ✅ CAMBIO: Guardar en public/images en lugar de images
-        $dir = 'public/images';  // ← Era 'images'
-        $fullPath = storage_path('app/' . $dir);
-        if (!is_dir($fullPath)) {
-            mkdir($fullPath, 0755, true);
-        }
+        // Store images under the public disk 'images' directory
+        $dir = 'images';
 
         $id = Str::random(12);
-        $filename = $id . '.png';
+        $filename = $id . '.jpg';
         $path = $dir . '/' . $filename;
 
-        // Convert to PNG
-        $pngBytes = $this->ensurePngBytes($bytes);
-        $filePath = storage_path('app/' . $path);
-        file_put_contents($filePath, $pngBytes);
+        // Ensure we store the bytes as JPEG (re-encode if necessary)
+        $jpegBytes = $this->ensureJpegBytes($bytes);
+        // Use Storage facade to write the file into storage/app/public/images
+        Storage::disk('public')->put($path, $jpegBytes);
+        $filePath = storage_path('app/public/' . $path);
         $size = filesize($filePath);
 
         // ✅ NUEVO: Generar URL pública
-        $publicUrl = url('storage/images/' . $filename);
+        $publicUrl = Storage::disk('public')->url($path);
 
         $meta = $this->loadImageMetadata();
         $entry = [
             'id' => $id,
             'filename' => $filename,
-            'path' => $path,  // storage/app/public/images/abc123.png
-            'url' => $publicUrl,  // ✅ NUEVO: https://api.incadev.com/storage/images/abc123.png
+            'path' => $path,  // storage/app/public/images/abc123.jpg (path relative to public disk)
+            'url' => $publicUrl,  // ✅ NUEVO: https://api.incadev.com/storage/images/abc123.jpg
             'original_prompt' => $originalPrompt,
             'model' => $model,
             'size' => $size,
+            'mime' => 'image/jpeg',
             'created_at' => now()->toDateTimeString(),
         ];
 
@@ -520,14 +518,14 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
     }
 
     /**
-     * Ensure the provided bytes represent a PNG image. If we can decode into an image
-     * resource we re-encode as PNG; otherwise fall back to the original bytes.
+     * Ensure the provided bytes represent a JPEG image. If we can decode into an image
+     * resource we re-encode as JPEG; otherwise fall back to the original bytes.
      */
-    protected function ensurePngBytes(string $bytes): string
+    protected function ensureJpegBytes(string $bytes): string
     {
-        // quick check for a PNG header
-        if (strncmp($bytes, "\x89PNG\r\n\x1a\n", 8) === 0) {
-            return $bytes; // already PNG
+        // Check for JPEG header (0xFF 0xD8 0xFF) — if already JPEG, return as-is
+        if (strncmp($bytes, "\xFF\xD8\xFF", 3) === 0) {
+            return $bytes; // already JPEG
         }
 
         // Attempt to create an image resource from the bytes
@@ -535,12 +533,13 @@ $enrichedPrompt = $this->enrichPromptForEducation($userPrompt);
             $im = @imagecreatefromstring($bytes);
             if ($im !== false) {
                 ob_start();
-                // Re-encode as PNG for consistent storage
-                imagepng($im);
+                // Re-encode as JPEG for smaller sizes and consistent storage
+                // Use 85 quality to keep a balance between size and quality
+                imagejpeg($im, null, 85);
                 imagedestroy($im);
-                $png = ob_get_clean();
-                if ($png !== false && strlen($png) > 0) {
-                    return $png;
+                $jpeg = ob_get_clean();
+                if ($jpeg !== false && strlen($jpeg) > 0) {
+                    return $jpeg;
                 }
             }
         }
